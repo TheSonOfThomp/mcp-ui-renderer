@@ -1,8 +1,9 @@
-import { defineConfig, type Plugin, type UserConfig } from 'vite'
+import { defineConfig, build, type Plugin, type UserConfig, type InlineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { resolve, dirname, basename, parse } from 'path'
 import { fileURLToPath } from 'url'
 import fs from 'fs'
+import { viteSingleFile } from "vite-plugin-singlefile"
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -27,30 +28,87 @@ const microUIPlugin = (): Plugin => {
   }
 
   const getEntry = (name: string) => {
-    // Use a regex or replaceAll to replace all occurrences
     return entryTemplateContent.replace(/__COMPONENT_NAME__/g, name)
+  }
+
+  // Helper to generate the config for a single micro-UI build
+  const getComponentBuildConfig = (name: string): InlineConfig => {
+    const input: Record<string, string> = {}
+    input[name] = `virtual:micro-uis/${name}.html`
+
+    return {
+      configFile: false, // Don't load this file again to avoid recursion
+      root: resolve(__dirname),
+      plugins: [
+        react(), 
+        microUIPlugin(), // We need this to resolve the virtual modules
+        viteSingleFile() // Inline everything for this component
+      ],
+      build: {
+        rollupOptions: {
+          input
+        },
+        emptyOutDir: false, // Don't wipe previous builds
+      }
+    }
   }
 
   return {
     name: 'micro-ui-entry-generator',
-    config() {
+    
+    // Orchestrate the builds when running "vite build" (production)
+    async closeBundle() {
+      // This hook runs after the main build finishes
+      // We only want to run this if we are the "main" build process
+      if (process.env.MICRO_UI_CHILD_BUILD) return;
+
+      console.log('\n🏗️  Building Micro-UIs...')
+      
+      for (const component of components) {
+        console.log(`  • ${component}`)
+        // Set the env var for the child process
+        process.env.MICRO_UI_CHILD_BUILD = 'true'
+        
+        try {
+          await build({
+            ...getComponentBuildConfig(component),
+            mode: 'production',
+          })
+        } finally {
+          // Clean up
+          delete process.env.MICRO_UI_CHILD_BUILD
+        }
+      }
+      console.log('✅ Micro-UIs built successfully.\n')
+    },
+
+    config(_config, { mode }) {
+      // If this is a child build, we don't need to touch the config here
+      // because `getComponentBuildConfig` sets it up explicitly.
+      if (process.env.MICRO_UI_CHILD_BUILD) return;
+
+      // This is the Main / Dev config
       const input: Record<string, string> = {
         main: resolve(__dirname, 'index.html'),
       }
-
-      // Add an input for each component
-      components.forEach(name => {
-        input[name] = `virtual:micro-uis/${name}.html`
-      })
+      
+      // In dev mode, expose all micro-UIs so they can be accessed
+      if (mode === 'development') {
+         components.forEach(name => {
+          input[name] = `virtual:micro-uis/${name}.html`
+        })
+      }
 
       return {
         build: {
           rollupOptions: {
             input
-          }
+          },
+          emptyOutDir: true, // Clear dist for the main build
         }
       } as UserConfig
     },
+
     resolveId(id) {
       if (id.startsWith('virtual:micro-uis/')) {
         return id
@@ -76,11 +134,9 @@ const microUIPlugin = (): Plugin => {
         const url = req.url?.split('?')[0]
         if (url && url.endsWith('.html')) {
           const name = basename(url, '.html')
-          // Check if this matches one of our components
           if (components.includes(name)) {
             const html = getHtml(name, `/@id/virtual:micro-uis/${name}.entry.tsx`)
             try {
-              // Transform HTML (inject Vite scripts)
               const transformed = await server.transformIndexHtml(req.url || '/', html)
               res.setHeader('Content-Type', 'text/html')
               res.end(transformed)
@@ -99,5 +155,9 @@ const microUIPlugin = (): Plugin => {
 
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [react(), microUIPlugin()],
+  plugins: [
+    react(), 
+    microUIPlugin(), 
+    viteSingleFile(), // Inline assets for the main build as well
+  ],
 })
